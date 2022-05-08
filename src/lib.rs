@@ -132,6 +132,10 @@ impl AsyncRead for WatchedFile {
                         // on Linux and possibly other OS (that i haven't been able to check yet) a remove event is only
                         // emitted after the last Fd pointing to the original file (inode technically) is closed, so we close
                         // and reopen our handle here to detect file deletion
+                        //
+                        // we could also is https://doc.rust-lang.org/std/path/struct.Path.html#method.is_file but
+                        // that could trigger a race-issue where a file is deleted and then reconstructed, leaving us
+                        // reading from the old inode while the file was actually truncated?
                         #[cfg(not(target_os = "windows"))]
                         {
                             match std::fs::File::open(self.path) {
