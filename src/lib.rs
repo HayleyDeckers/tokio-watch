@@ -69,7 +69,7 @@ impl AsyncRead for WatchedFile {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::result::Result<(), std::io::Error>> {
-        println!("watchedFile::poll");
+        // println!("watchedFile::poll");
         let this = unsafe { self.get_unchecked_mut() };
         let size_before_poll = buf.filled().len();
 
@@ -84,19 +84,19 @@ impl AsyncRead for WatchedFile {
                 Poll::Ready(Ok(())) => {
                     let eof_reached = size_before_poll == buf.filled().len();
                     if !eof_reached {
-                        println!("read without hittin EOF");
+                        // println!("read without hittin EOF");
                         this.last_seek_location = 0;
                         return Poll::Ready(Ok(()));
                     }
                 }
                 Poll::Pending => {
-                    println!("am pending...");
+                    // println!("am pending...");
                     return Poll::Pending;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
         }
-        println!("EOF reached");
+        // println!("EOF reached");
         //else if eof has been reached
         let (file, state, seek_loc) = {
             (
@@ -109,10 +109,10 @@ impl AsyncRead for WatchedFile {
         //todo: extend lock to
         match state.lock().unwrap().borrow_mut().state {
             FileState::Modified => {
-                println!("in modified state..");
+                // println!("in modified state..");
                 match file.map(|f| f.try_into_std()) {
                     Some(Ok(mut file)) => {
-                        if *seek_loc >= 1 {
+                        if *seek_loc > 0 {
                             //we were at EOF, got awoken by a modify event, but still hit EOF
                             // this means that whatever modification happend can't have been an append
                             // and we have lost track of the state of the file, so we return to the start of the file.
@@ -122,7 +122,7 @@ impl AsyncRead for WatchedFile {
                             eprintln!("file truncated");
                             *seek_loc = file.seek(SeekFrom::Start(0)).unwrap();
                         } else {
-                            *seek_loc = 1;
+                            *seek_loc = file.seek(SeekFrom::Current(0)).unwrap();
                         }
                         // on windows, events are emmitted if our file is deleted or renamed even if
                         // there's still an open Fd (i.e. ours), so we can reuse our existing link
@@ -139,8 +139,9 @@ impl AsyncRead for WatchedFile {
                         // reading from the old inode while the file was actually truncated?
                         #[cfg(not(target_os = "windows"))]
                         {
-                            match std::fs::File::open(self.path) {
-                                Ok(file) => {
+                            match std::fs::File::open(this.path.clone()) {
+                                Ok(mut file) => {
+                                    file.seek(SeekFrom::Start(*seek_loc)).unwrap();
                                     this.file.replace(tokio::fs::File::from_std(file));
                                 }
                                 Err(e) => {
@@ -149,7 +150,7 @@ impl AsyncRead for WatchedFile {
                                     //
                                     // todo: Technically the file could still exist, perhaps it was recreated with new permissions and we are now not allowed to open it
                                     // but for now this will do.
-                                    return Poll::Ready(Ok());
+                                    return Poll::Ready(Ok(()));
                                 }
                             };
                         }
@@ -163,10 +164,10 @@ impl AsyncRead for WatchedFile {
                 }
             }
             //file was deleted and we read all the contents still buffered.
-            FileState::Deleted => {println!("in deleted state.."); return Poll::Ready(Ok(()))},
+            FileState::Deleted => {/*println!("in deleted state..");*/ return Poll::Ready(Ok(()))},
         }
         state.lock().unwrap().borrow_mut().waker = Some(cx.waker().clone());
-        println!("pending...");
+        // println!("pending...");
         return Poll::Pending;
     }
     // if eof_reached {}
@@ -183,7 +184,7 @@ impl WatchedFile {
             shared_state: shared_state.clone(),
         };
         let mut watcher = notify::recommended_watcher(move |res| {
-            eprintln!("\t got result: {:?}\n", res);
+            // eprintln!("\t got result: {:?}\n", res);
             match res {
             Ok(Event {
                 kind: EventKind::Modify(ModifyKind::Name(_)),
@@ -193,7 +194,7 @@ impl WatchedFile {
                 kind: EventKind::Remove(_),
                 ..
             }) => {
-                println!("file was removed");
+                // println!("file was removed");
                 waker.wake(FileState::Deleted);
                 return;
             }
@@ -201,11 +202,11 @@ impl WatchedFile {
                 kind: EventKind::Modify(_),
                 ..
             }) => {
-                println!("file was modified");
-                pauser.wake(FileState::Modified);
+                // println!("file was modified");
+                waker.wake(FileState::Modified);
             }
             Err(e) => println!("watch error: {:?}", e),
-            _ => {println!("dont know this event");}
+            _ => {/*println!("dont know this event");*/}
         }})?;
         watcher.configure(Config::PreciseEvents(true))?;
         watcher.watch(path.as_ref(), RecursiveMode::NonRecursive)?;

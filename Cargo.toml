@@ -8,8 +8,14 @@ edition = "2021"
 [[example]]
 name = "simple"
 
+[[example]]
+name = "auth"
+
+
 [dev-dependencies]
 tokio = {version = "1", features = ["fs", "rt-multi-thread", "io-util", "macros", "signal", "time"]}
+reqwest = {version = "0.11", features = ["json"]}
+serde = { version = "1.0", features = ["derive"] }
 
 [dependencies]
 tokio = {version = "1", features = ["fs"]}

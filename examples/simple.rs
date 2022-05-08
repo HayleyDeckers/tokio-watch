@@ -45,9 +45,9 @@ async fn main() -> Result<()> {
         //and recreate it
         write_test_file("watched.txt", false).await?;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        println!("sending delete");
+        // println!("sending delete");
         tokio::fs::remove_file("watched.txt").await?;
-        println!("file deleted");
+        // println!("file deleted");
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     });
 
@@ -57,8 +57,8 @@ async fn main() -> Result<()> {
             println!("{}", line);
         }
     });
-    tokio::signal::ctrl_c().await?;
+    // tokio::signal::ctrl_c().await?;
     
-    // handle.await?;
+    handle.await?;
     Ok(())
 }
