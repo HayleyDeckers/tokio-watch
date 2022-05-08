@@ -72,7 +72,7 @@ impl AsyncRead for WatchedFile {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::result::Result<(), std::io::Error>> {
-        // println!("watchedFile::poll");
+        println!("watchedFile::poll");
         let this = unsafe { self.get_unchecked_mut() };
         let size_before_poll = buf.filled().len();
 
@@ -87,19 +87,19 @@ impl AsyncRead for WatchedFile {
                 Poll::Ready(Ok(())) => {
                     let eof_reached = size_before_poll == buf.filled().len();
                     if !eof_reached {
-                        // println!("read without hittin EOF");
+                        println!("read without hittin EOF");
                         this.last_seek_location = 0;
                         return Poll::Ready(Ok(()));
                     }
                 }
                 Poll::Pending => {
-                    // println!("am pending...");
+                    println!("am pending...");
                     return Poll::Pending;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
         }
-        // println!("EOF reached");
+        println!("EOF reached");
         //else if eof has been reached
         let (file, state, seek_loc) = {
             (
@@ -111,6 +111,7 @@ impl AsyncRead for WatchedFile {
         };
         match state.lock().unwrap().borrow_mut().state {
             FileState::Modified => {
+                println!("in modified state..");
                 match file.map(|f| f.try_into_std()) {
                     Some(Ok(mut file)) => {
                         if *seek_loc >= 1 {
@@ -133,10 +134,10 @@ impl AsyncRead for WatchedFile {
                 }
             }
             //file was deleted and we read all the contents still buffered.
-            FileState::Deleted => return Poll::Ready(Ok(())),
+            FileState::Deleted => {println!("in deleted state.."); return Poll::Ready(Ok(()))},
         }
-
         state.lock().unwrap().borrow_mut().waker = Some(cx.waker().clone());
+        println!("pending...");
         return Poll::Pending;
     }
     // if eof_reached {}
@@ -152,7 +153,9 @@ impl WatchedFile {
         let mut pauser = Pauser {
             shared_state: shared_state.clone(),
         };
-        let mut watcher = notify::recommended_watcher(move |res| match res {
+        let mut watcher = notify::recommended_watcher(move |res| {
+            eprintln!("\t got result: {:?}\n", res);
+            match res {
             Ok(Event {
                 kind: EventKind::Modify(ModifyKind::Name(_)),
                 ..
@@ -170,11 +173,12 @@ impl WatchedFile {
                 ..
             }) => {
                 // println!("file was modified");
+                println!("file was modified");
                 pauser.wake(FileState::Modified);
             }
             Err(e) => println!("watch error: {:?}", e),
-            _ => {}
-        })?;
+            _ => {println!("dont know this event");}
+        }})?;
         watcher.configure(Config::PreciseEvents(true))?;
         watcher.watch(path.as_ref(), RecursiveMode::NonRecursive)?;
 

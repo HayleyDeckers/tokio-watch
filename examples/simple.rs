@@ -15,7 +15,7 @@ async fn write_test_file(path: impl AsRef<Path>, append: bool) -> Result<()> {
     if append {
         file.seek(SeekFrom::End(0)).await?;
     }
-    for i in 0..20 {
+    for i in 0..5 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         file.write_all(format!("Line {}\n", i).as_bytes()).await?;
         file.sync_data().await?;
@@ -44,6 +44,10 @@ async fn main() -> Result<()> {
         write_test_file("watched.txt", true).await?;
         //and recreate it
         write_test_file("watched.txt", false).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        println!("sending delete");
+        tokio::fs::remove_file("watched.txt").await?;
+        println!("file deleted");
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     });
 
@@ -54,7 +58,7 @@ async fn main() -> Result<()> {
         }
     });
     tokio::signal::ctrl_c().await?;
-    tokio::fs::remove_file("watched.txt").await?;
-    handle.await?;
+    
+    // handle.await?;
     Ok(())
 }
