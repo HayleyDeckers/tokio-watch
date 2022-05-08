@@ -4,7 +4,7 @@ use notify::event::ModifyKind;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::borrow::BorrowMut;
 use std::io::{Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::task::Waker;
 use tokio::fs::File;
 use tokio::io::AsyncRead;
@@ -14,28 +14,22 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 enum FileState {
     Modified,
     Deleted,
+    //on linux, a file that gets deleted won't actually be deleted until all inode's to it have been removed.
+    // NeedsReload,
 }
 
 use std::sync::{Arc, Mutex};
 struct SharedState {
-    /// Whether or not the future is paused
+    //todo: probably want to make this into some kind of queue instead of just the last seen event.
     state: FileState,
-    /// The waker for the task that `TimerFuture` is running on.
-    /// The thread can use this after setting `completed = true` to tell
-    /// `TimerFuture`'s task to wake up, see that `completed = true`, and
-    /// move forward.
     waker: Option<Waker>,
 }
 
-struct Pauser {
+struct WakerWrapper {
     shared_state: Arc<Mutex<SharedState>>,
 }
 
-impl Pauser {
-    // pub fn pause(&mut self) {
-    //     let mut shared_state = self.shared_state.lock().unwrap();
-    //     shared_state.paused = true;
-    // }
+impl WakerWrapper {
     fn wake(&mut self, state: FileState) -> bool {
         let mut shared_state = self.shared_state.lock().unwrap();
         shared_state.state = state;
@@ -62,11 +56,14 @@ pub struct WatchedFile {
     file: Option<tokio::fs::File>,
     last_seek_location: u64,
     shared_state: Arc<Mutex<SharedState>>,
+    #[cfg(not(target_os = "windows"))]
+    path: PathBuf,
     //only here to tie the lifetimes together
     _watcher: RecommendedWatcher,
 }
 
 impl AsyncRead for WatchedFile {
+    //todo: cleanup pins and extend guarantess
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -109,21 +106,53 @@ impl AsyncRead for WatchedFile {
                 &mut this.last_seek_location,
             )
         };
+        //todo: extend lock to
         match state.lock().unwrap().borrow_mut().state {
             FileState::Modified => {
                 println!("in modified state..");
                 match file.map(|f| f.try_into_std()) {
                     Some(Ok(mut file)) => {
                         if *seek_loc >= 1 {
+                            //we were at EOF, got awoken by a modify event, but still hit EOF
+                            // this means that whatever modification happend can't have been an append
+                            // and we have lost track of the state of the file, so we return to the start of the file.
+                            // this is similar to how tail -f behaves.
+                            //
+                            // Note that most editors will also trigger this.
                             eprintln!("file truncated");
                             *seek_loc = file.seek(SeekFrom::Start(0)).unwrap();
-                            // println!("seeked to {}", seek_loc);
                         } else {
-                            // println!("incrementing seek_loc");
                             *seek_loc = 1;
                         }
-                        // println!("hit EOF at {}", this.last_seek_location);
-                        this.file.replace(tokio::fs::File::from_std(file));
+                        // on windows, events are emmitted if our file is deleted or renamed even if
+                        // there's still an open Fd (i.e. ours), so we can reuse our existing link
+                        #[cfg(target_os = "windows")]
+                        {
+                            this.file.replace(tokio::fs::File::from_std(file));
+                        }
+                        // on Linux and possibly other OS (that i haven't been able to check yet) a remove event is only
+                        // emitted after the last Fd pointing to the original file (inode technically) is closed, so we close
+                        // and reopen our handle here to detect file deletion
+                        //
+                        // we could also is https://doc.rust-lang.org/std/path/struct.Path.html#method.is_file but
+                        // that could trigger a race-issue where a file is deleted and then reconstructed, leaving us
+                        // reading from the old inode while the file was actually truncated?
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            match std::fs::File::open(self.path) {
+                                Ok(file) => {
+                                    this.file.replace(tokio::fs::File::from_std(file));
+                                }
+                                Err(e) => {
+                                    //the file couldn't be opened for whatever reason.
+                                    // so we return EOF.
+                                    //
+                                    // todo: Technically the file could still exist, perhaps it was recreated with new permissions and we are now not allowed to open it
+                                    // but for now this will do.
+                                    return Poll::Ready(Ok());
+                                }
+                            };
+                        }
                     }
                     Some(Err(file)) => {
                         this.file.replace(file);
@@ -150,7 +179,7 @@ impl WatchedFile {
             waker: None,
         }));
         let file = File::open(path.as_ref()).await?;
-        let mut pauser = Pauser {
+        let mut waker = WakerWrapper {
             shared_state: shared_state.clone(),
         };
         let mut watcher = notify::recommended_watcher(move |res| {
@@ -165,14 +194,13 @@ impl WatchedFile {
                 ..
             }) => {
                 println!("file was removed");
-                pauser.wake(FileState::Deleted);
+                waker.wake(FileState::Deleted);
                 return;
             }
             Ok(Event {
                 kind: EventKind::Modify(_),
                 ..
             }) => {
-                // println!("file was modified");
                 println!("file was modified");
                 pauser.wake(FileState::Modified);
             }
@@ -186,6 +214,8 @@ impl WatchedFile {
             file: Some(file),
             shared_state: shared_state.clone(),
             _watcher: watcher,
+            #[cfg(not(target_os = "windows"))]
+            path: path.as_ref().into(),
             last_seek_location: 0,
         })
     }
