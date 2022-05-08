@@ -25,7 +25,7 @@ struct ResponseWrapper{
 #[tokio::main]
 async fn main() -> Result<()> {
     let file = WatchedFile::new("/var/log/auth.log").await?;
-    let abuse_ip_key = tokio::fs::read_to_string("/home/disbot/abuseip.key").await?;
+    let abuse_ip_key = tokio::fs::read_to_string("./abuseip.key").await?;
     let handle = tokio::spawn(async move {
         let mut ip_to_count = std::collections::hash_map::HashMap::<IpAddr, usize>::new();
         let mut file = BufReader::new(file).lines();
