@@ -3,19 +3,28 @@ use core::task::{Context, Poll};
 use notify::event::ModifyKind;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::borrow::BorrowMut;
+use std::future::Future;
 use std::io::{Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::task::Waker;
 use tokio::fs::File;
 use tokio::io::AsyncRead;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+#[derive(Clone, Copy)]
 enum FileState {
     Modified,
     Deleted,
+    WaitingEOF,
     //on linux, a file that gets deleted won't actually be deleted until all inode's to it have been removed.
     // NeedsReload,
+}
+
+enum FileOpenState {
+    Closed,
+    Open(File),
+    Opening(Pin<Box<dyn Future<Output = tokio::io::Result<File>> + Send>>),
 }
 
 use std::sync::{Arc, Mutex};
@@ -53,11 +62,14 @@ on eof:
     - when woken up check append vs. recreate
 */
 pub struct WatchedFile {
-    file: Option<tokio::fs::File>,
+    file: FileOpenState,
     last_seek_location: u64,
+    at_eof: bool,
     shared_state: Arc<Mutex<SharedState>>,
-    #[cfg(not(target_os = "windows"))]
-    path: PathBuf,
+    //on non-windows OS we need to close and reopen the file occasionaly to detect deletes.
+    // so we remember the PathBuf to pass to tokio::file::Open
+    // #[cfg(not(target_os = "windows"))]
+    path: std::path::PathBuf,
     //only here to tie the lifetimes together
     _watcher: RecommendedWatcher,
 }
@@ -69,108 +81,95 @@ impl AsyncRead for WatchedFile {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::result::Result<(), std::io::Error>> {
-        // println!("watchedFile::poll");
         let this = unsafe { self.get_unchecked_mut() };
         let size_before_poll = buf.filled().len();
 
-        let file = { &mut this.file };
-        //we need to have a file in the option
-        if let Some(file) = file {
+        //if the file was close last poll, start a future to open it.
+        if let FileOpenState::Closed = &mut this.file {
+            //we box::pin the future because tokio doesn't return a concrete type here
+            this.at_eof = false;
+            this.file = FileOpenState::Opening(Box::pin(File::open(this.path.clone())));
+        }
+        if let FileOpenState::Opening(fut) = &mut this.file {
+            //if the file was currently being opened, drive that future
+            match Pin::new(fut).poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => {
+                    //todo: handle file not found => EOF
+                    return Poll::Ready(Err(e));
+                }
+                //if the file is opened succesfully, set this.file and continue as normal.
+                Poll::Ready(Ok(file)) => {
+                    this.file = FileOpenState::Open(file);
+                }
+            }
+        }
+
+        //take the file out of the pin
+        return if let FileOpenState::Open(file) = &mut this.file {
+            //and pin it in place here.
+            // this is safe because we have a reference to member of a pinned struct
             let file = unsafe { core::pin::Pin::new_unchecked(file) };
-            // let mut eof_reached = false;
-            //which we then poll read
+            //try and read from the file into the buffer
             match file.poll_read(cx, buf) {
-                //and it returns as normal _if_ EOF hasn't been reached.
-                Poll::Ready(Ok(())) => {
-                    let eof_reached = size_before_poll == buf.filled().len();
-                    if !eof_reached {
-                        // println!("read without hittin EOF");
-                        this.last_seek_location = 0;
-                        return Poll::Ready(Ok(()));
-                    }
-                }
                 Poll::Pending => {
-                    // println!("am pending...");
-                    return Poll::Pending;
+                    //return pending as-is
+                    Poll::Pending
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                //return errors as-is
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {
+                    let bytes_read = buf.filled().len() - size_before_poll;
+                    this.last_seek_location += bytes_read as u64;
+                    if bytes_read != 0 {
+                        //as long as the file has not reached EOF we return the results as normal
+                        this.at_eof = false;
+                        Poll::Ready(Ok(()))
+                    } else {
+                        let mut lock = this.shared_state.lock().unwrap();
+                        let shared_state = lock.borrow_mut();
+                        match shared_state.state {
+                            FileState::Deleted => {
+                                //we hit EOF on our open file descriptor and the OS has reported that the file has been deleted sometime between us opening and hitting EOF
+                                // so this is truely EOF.
+                                Poll::Ready(Ok(()))
+                            }
+                            _ => {
+                                //we've hit EOF but the file hasn't been deleted yet
+                                //so we tell the file watched how to wake us
+                                shared_state.waker = Some(cx.waker().clone());
+                                //and set the current state to 'waiting for new events.
+                                shared_state.state = FileState::WaitingEOF;
+                                //if we hit EOF twice in a row, that means the file was most likely truncated.
+                                // reseek to zero.
+                                if this.at_eof {
+                                    //...
+                                    // either reseek to zero (maybe reopen file?)
+                                    // or return an error?
+                                    eprintln!("File truncated");
+                                    this.file = FileOpenState::Closed;
+                                    cx.waker().wake_by_ref();
+                                    Poll::Pending
+                                } else {
+                                    //mark that last poll we were at EOF.
+                                    this.at_eof = true;
+                                    //on Linux (and possibly other non-windows OS) we have to close our file to trigger a delete event from being generated.
+                                    #[cfg(not(target_os = "windows"))]
+                                    {
+                                        // this.file = FileOpenState::Closed
+                                    }
+
+                                    Poll::Pending
+                                }
+                            }
+                        }
+                    }
+                }
             }
-        }
-        // println!("EOF reached");
-        //else if eof has been reached
-        let (file, state, seek_loc) = {
-            (
-                this.file.take(),
-                // core::pin::Pin::new_unchecked(&mut this.updated),
-                &mut this.shared_state,
-                &mut this.last_seek_location,
-            )
+        } else {
+            unreachable!("we already exhausted all other options")
         };
-        //todo: extend lock to
-        match state.lock().unwrap().borrow_mut().state {
-            FileState::Modified => {
-                // println!("in modified state..");
-                match file.map(|f| f.try_into_std()) {
-                    Some(Ok(mut file)) => {
-                        if *seek_loc > 0 {
-                            //we were at EOF, got awoken by a modify event, but still hit EOF
-                            // this means that whatever modification happend can't have been an append
-                            // and we have lost track of the state of the file, so we return to the start of the file.
-                            // this is similar to how tail -f behaves.
-                            //
-                            // Note that most editors will also trigger this.
-                            eprintln!("file truncated");
-                            *seek_loc = file.seek(SeekFrom::Start(0)).unwrap();
-                        } else {
-                            *seek_loc = file.seek(SeekFrom::Current(0)).unwrap();
-                        }
-                        // on windows, events are emmitted if our file is deleted or renamed even if
-                        // there's still an open Fd (i.e. ours), so we can reuse our existing link
-                        #[cfg(target_os = "windows")]
-                        {
-                            this.file.replace(tokio::fs::File::from_std(file));
-                        }
-                        // on Linux and possibly other OS (that i haven't been able to check yet) a remove event is only
-                        // emitted after the last Fd pointing to the original file (inode technically) is closed, so we close
-                        // and reopen our handle here to detect file deletion
-                        //
-                        // we could also is https://doc.rust-lang.org/std/path/struct.Path.html#method.is_file but
-                        // that could trigger a race-issue where a file is deleted and then reconstructed, leaving us
-                        // reading from the old inode while the file was actually truncated?
-                        #[cfg(not(target_os = "windows"))]
-                        {
-                            match std::fs::File::open(this.path.clone()) {
-                                Ok(mut file) => {
-                                    file.seek(SeekFrom::Start(*seek_loc)).unwrap();
-                                    this.file.replace(tokio::fs::File::from_std(file));
-                                }
-                                Err(e) => {
-                                    //the file couldn't be opened for whatever reason.
-                                    // so we return EOF.
-                                    //
-                                    // todo: Technically the file could still exist, perhaps it was recreated with new permissions and we are now not allowed to open it
-                                    // but for now this will do.
-                                    return Poll::Ready(Ok(()));
-                                }
-                            };
-                        }
-                    }
-                    Some(Err(file)) => {
-                        this.file.replace(file);
-                    }
-                    None => {
-                        unreachable!("file can't be none?");
-                    }
-                }
-            }
-            //file was deleted and we read all the contents still buffered.
-            FileState::Deleted => {/*println!("in deleted state..");*/ return Poll::Ready(Ok(()))},
-        }
-        state.lock().unwrap().borrow_mut().waker = Some(cx.waker().clone());
-        // println!("pending...");
-        return Poll::Pending;
     }
-    // if eof_reached {}
 }
 
 impl WatchedFile {
@@ -186,36 +185,38 @@ impl WatchedFile {
         let mut watcher = notify::recommended_watcher(move |res| {
             // eprintln!("\t got result: {:?}\n", res);
             match res {
-            Ok(Event {
-                kind: EventKind::Modify(ModifyKind::Name(_)),
-                ..
-            })
-            | Ok(Event {
-                kind: EventKind::Remove(_),
-                ..
-            }) => {
-                // println!("file was removed");
-                waker.wake(FileState::Deleted);
-                return;
+                Ok(Event {
+                    kind: EventKind::Modify(ModifyKind::Name(_)),
+                    ..
+                })
+                | Ok(Event {
+                    kind: EventKind::Remove(_),
+                    ..
+                }) => {
+                    // println!("file was removed");
+                    waker.wake(FileState::Deleted);
+                    return;
+                }
+                Ok(Event {
+                    kind: EventKind::Modify(_),
+                    ..
+                }) => {
+                    // println!("file was modified");
+                    waker.wake(FileState::Modified);
+                }
+                Err(e) => println!("watch error: {:?}", e),
+                _ => { /*println!("dont know this event");*/ }
             }
-            Ok(Event {
-                kind: EventKind::Modify(_),
-                ..
-            }) => {
-                // println!("file was modified");
-                waker.wake(FileState::Modified);
-            }
-            Err(e) => println!("watch error: {:?}", e),
-            _ => {/*println!("dont know this event");*/}
-        }})?;
+        })?;
         watcher.configure(Config::PreciseEvents(true))?;
         watcher.watch(path.as_ref(), RecursiveMode::NonRecursive)?;
 
         Ok(Self {
-            file: Some(file),
+            file: FileOpenState::Open(file),
             shared_state: shared_state.clone(),
+            at_eof: false,
             _watcher: watcher,
-            #[cfg(not(target_os = "windows"))]
+            // #[cfg(not(target_os = "windows"))]
             path: path.as_ref().into(),
             last_seek_location: 0,
         })
