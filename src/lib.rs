@@ -4,11 +4,12 @@ use notify::event::ModifyKind;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::borrow::BorrowMut;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
 use std::task::Waker;
 use tokio::fs::File;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncSeek};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -24,6 +25,7 @@ enum FileState {
 enum FileOpenState {
     Closed,
     Open(File),
+    Seeking(File),
     Opening(Pin<Box<dyn Future<Output = tokio::io::Result<File>> + Send>>),
 }
 
@@ -96,12 +98,60 @@ impl AsyncRead for WatchedFile {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => {
                     //todo: handle file not found => EOF
-                    return Poll::Ready(Err(e));
+                    return match e.kind() {
+                        //we include permission denied here because the file _previously_ existed with this name and the right permissions
+                        //so if the file gets deleted/recreated with new permissions it would trigger that error which we consider "not the same file"
+                        ErrorKind::NotFound | ErrorKind::PermissionDenied => Poll::Ready(Ok(())),
+                        _ => Poll::Ready(Err(e)),
+                    };
                 }
                 //if the file is opened succesfully, set this.file and continue as normal.
-                Poll::Ready(Ok(file)) => {
-                    this.file = FileOpenState::Open(file);
+                Poll::Ready(Ok(mut file)) => {
+                    //on "not windows" we close the file at every EOF so try and seek ahead
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        Pin::new(file).start_seek(SeekFrom::End(0))?;
+                        this.file = FileOpenState::Seeking(file);
+                    }
+                    //on windows this only occurs if the file was truncated so we don't have to do the seek dance and just start from zero.
+                    #[cfg(target_os = "windows")]
+                    {
+                        this.file = FileOpenState::Open(file);
+                    }
                 }
+            }
+        }
+
+        let seek_to = if let FileOpenState::Seeking(file) = &mut this.file {
+            let file = unsafe { core::pin::Pin::new_unchecked(file) };
+            let poll_result = file.poll_complete(cx)?;
+            if let Poll::Ready(size) = poll_result {
+                if size < this.last_seek_location {
+                    eprintln!("file truncated");
+                    this.last_seek_location = 0;
+                    Some(0)
+                } else if size > this.last_seek_location {
+                    //we overshot, end is now past where we left off
+                    Some(this.last_seek_location)
+                }
+                //else we are where we left off in the stream.
+                else {
+                    None
+                }
+            } else {
+                return Poll::Pending;
+            }
+        } else {
+            None
+        };
+
+        if let Some(seek_to) = seek_to {
+            if let FileOpenState::Seeking(file) = &mut this.file {
+                let file = unsafe { core::pin::Pin::new_unchecked(file) };
+                file.start_seek(SeekFrom::Start(seek_to))?;
+                //start over again waiting on this new seek to finish.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
         }
 
@@ -156,7 +206,7 @@ impl AsyncRead for WatchedFile {
                                     //on Linux (and possibly other non-windows OS) we have to close our file to trigger a delete event from being generated.
                                     #[cfg(not(target_os = "windows"))]
                                     {
-                                        // this.file = FileOpenState::Closed
+                                        this.file = FileOpenState::Closed
                                     }
 
                                     Poll::Pending
@@ -183,7 +233,7 @@ impl WatchedFile {
             shared_state: shared_state.clone(),
         };
         let mut watcher = notify::recommended_watcher(move |res| {
-            // eprintln!("\t got result: {:?}\n", res);
+            eprintln!("\t got result: {:?}\n", res);
             match res {
                 Ok(Event {
                     kind: EventKind::Modify(ModifyKind::Name(_)),
