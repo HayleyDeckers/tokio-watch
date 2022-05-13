@@ -215,7 +215,7 @@ async fn main() -> Result<()> {
 
     tokio::signal::ctrl_c().await?;
     println!("shutting down...");
-    shutdown_tx.send(()).unwrap();
+    
     let db = ip_handle.await?;
     db.to_csv("abuse_db_2.csv")?;
     Ok(())
