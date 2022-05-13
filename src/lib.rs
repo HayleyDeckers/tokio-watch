@@ -9,7 +9,7 @@ use std::io::{Seek, SeekFrom};
 use std::path::Path;
 use std::task::Waker;
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncSeek};
+use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -24,8 +24,8 @@ enum FileState {
 
 enum FileOpenState {
     Closed,
-    Open(File),
-    Seeking(File),
+    Open,
+    Seeking,
     Opening(Pin<Box<dyn Future<Output = tokio::io::Result<File>> + Send>>),
 }
 
@@ -64,7 +64,8 @@ on eof:
     - when woken up check append vs. recreate
 */
 pub struct WatchedFile {
-    file: FileOpenState,
+    file: Option<File>,
+    file_state: FileOpenState,
     last_seek_location: u64,
     at_eof: bool,
     shared_state: Arc<Mutex<SharedState>>,
@@ -87,12 +88,12 @@ impl AsyncRead for WatchedFile {
         let size_before_poll = buf.filled().len();
 
         //if the file was close last poll, start a future to open it.
-        if let FileOpenState::Closed = &mut this.file {
+        if let FileOpenState::Closed = &mut this.file_state {
             //we box::pin the future because tokio doesn't return a concrete type here
             this.at_eof = false;
-            this.file = FileOpenState::Opening(Box::pin(File::open(this.path.clone())));
+            this.file_state = FileOpenState::Opening(Box::pin(File::open(this.path.clone())));
         }
-        if let FileOpenState::Opening(fut) = &mut this.file {
+        if let FileOpenState::Opening(fut) = &mut this.file_state {
             //if the file was currently being opened, drive that future
             match Pin::new(fut).poll(cx) {
                 Poll::Pending => return Poll::Pending,
@@ -110,56 +111,65 @@ impl AsyncRead for WatchedFile {
                     //on "not windows" we close the file at every EOF so try and seek ahead
                     #[cfg(not(target_os = "windows"))]
                     {
-                        Pin::new(file).start_seek(SeekFrom::End(0))?;
-                        this.file = FileOpenState::Seeking(file);
+                        Pin::new(&mut file).start_seek(SeekFrom::End(0))?;
+                        this.file_state = FileOpenState::Seeking;
+                        this.file = Some(file);
                     }
                     //on windows this only occurs if the file was truncated so we don't have to do the seek dance and just start from zero.
                     #[cfg(target_os = "windows")]
                     {
-                        this.file = FileOpenState::Open(file);
+                        this.file = Some(file);
+                    }
+                    eprintln!("\t reopend file {:?}!", this.path);
+                }
+            }
+        }
+        {
+            let file = Pin::new(this.file.as_mut().unwrap());
+            let seek_to = if let FileOpenState::Seeking = &mut this.file_state {
+                // let file = unsafe { core::pin::Pin::new_unchecked() };
+                match file.poll_complete(cx)? {
+                    Poll::Pending => {
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(size) => {
+                        if size < this.last_seek_location {
+                            eprintln!("file truncated");
+                            this.last_seek_location = 0;
+                            // file.start_seek(SeekFrom::Start(0))?;
+                            // cx.waker().wake_by_ref();
+                            // return Poll::Pending;
+                            Some(0)
+                        } else if size > this.last_seek_location {
+                            //we overshot, end is now past where we left off
+                            // file.start_seek(SeekFrom::Start(this.last_seek_location))?;
+                            // cx.waker().wake_by_ref();
+                            // return Poll::Pending;
+                            Some(this.last_seek_location)
+                        } else {
+                            // this.file_state = FileOpenState::Open;
+                            None
+                        }
                     }
                 }
-            }
-        }
-
-        let seek_to = if let FileOpenState::Seeking(file) = &mut this.file {
-            let file = unsafe { core::pin::Pin::new_unchecked(file) };
-            let poll_result = file.poll_complete(cx)?;
-            if let Poll::Ready(size) = poll_result {
-                if size < this.last_seek_location {
-                    eprintln!("file truncated");
-                    this.last_seek_location = 0;
-                    Some(0)
-                } else if size > this.last_seek_location {
-                    //we overshot, end is now past where we left off
-                    Some(this.last_seek_location)
-                }
-                //else we are where we left off in the stream.
-                else {
-                    None
-                }
             } else {
-                return Poll::Pending;
-            }
-        } else {
-            None
-        };
-
-        if let Some(seek_to) = seek_to {
-            if let FileOpenState::Seeking(file) = &mut this.file {
-                let file = unsafe { core::pin::Pin::new_unchecked(file) };
+                None
+            };
+            if let Some(seek_to) = seek_to {
+                let file = Pin::new(this.file.as_mut().unwrap());
                 file.start_seek(SeekFrom::Start(seek_to))?;
-                //start over again waiting on this new seek to finish.
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
+            } else {
+                this.file_state = FileOpenState::Open;
             }
         }
-
+        let file = Pin::new(this.file.as_mut().unwrap());
         //take the file out of the pin
-        return if let FileOpenState::Open(file) = &mut this.file {
+        return if let FileOpenState::Open = &mut this.file_state {
             //and pin it in place here.
             // this is safe because we have a reference to member of a pinned struct
-            let file = unsafe { core::pin::Pin::new_unchecked(file) };
+            // let file = unsafe { core::pin::Pin::new_unchecked(file) };
             //try and read from the file into the buffer
             match file.poll_read(cx, buf) {
                 Poll::Pending => {
@@ -197,7 +207,9 @@ impl AsyncRead for WatchedFile {
                                     // either reseek to zero (maybe reopen file?)
                                     // or return an error?
                                     eprintln!("File truncated");
-                                    this.file = FileOpenState::Closed;
+                                    this.file = None;
+                                    this.file_state = FileOpenState::Closed;
+                                    eprintln!("\t CLOSED file");
                                     cx.waker().wake_by_ref();
                                     Poll::Pending
                                 } else {
@@ -206,9 +218,10 @@ impl AsyncRead for WatchedFile {
                                     //on Linux (and possibly other non-windows OS) we have to close our file to trigger a delete event from being generated.
                                     #[cfg(not(target_os = "windows"))]
                                     {
-                                        this.file = FileOpenState::Closed
+                                        this.file = None;
+                                        this.file_state = FileOpenState::Closed;
+                                        eprintln!("\t CLOSED file {:?} at {}!", this.path, this.last_seek_location);
                                     }
-
                                     Poll::Pending
                                 }
                             }
@@ -223,6 +236,11 @@ impl AsyncRead for WatchedFile {
 }
 
 impl WatchedFile {
+    pub async fn tail(path: impl AsRef<Path>) -> Result<Self> {
+        let mut this = Self::new(path).await?;
+        this.last_seek_location =  this.file.as_mut().unwrap().seek(SeekFrom::End(0)).await?;
+        Ok(this)
+    }
     pub async fn new(path: impl AsRef<Path>) -> Result<Self> {
         let shared_state = Arc::new(Mutex::new(SharedState {
             state: FileState::Modified,
@@ -262,7 +280,8 @@ impl WatchedFile {
         watcher.watch(path.as_ref(), RecursiveMode::NonRecursive)?;
 
         Ok(Self {
-            file: FileOpenState::Open(file),
+            file: Some(file),
+            file_state: FileOpenState::Open,
             shared_state: shared_state.clone(),
             at_eof: false,
             _watcher: watcher,
